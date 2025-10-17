@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import trimesh
-import gradio as gr
+# import gradio as gr
 import numpy as np
 import matplotlib
 from scipy.spatial.transform import Rotation
@@ -455,3 +455,132 @@ def download_file_from_url(url, filename):
 
     except requests.exceptions.RequestException as e:
         print(f"Error downloading file: {e}")
+
+def predictions_to_ply(
+    predictions,
+    out_path="predicted_pointcloud.ply",
+    conf_thres=50.0,
+    filter_by_frames="all",
+    mask_black_bg=False,
+    mask_white_bg=False,
+    prediction_mode="Predicted Pointmap",
+    as_binary=True,
+) -> (str, trimesh.PointCloud):
+    """
+    Convert VGGT predictions to a colored PLY point cloud file.
+
+    Args:
+        predictions (dict): same format as used by predictions_to_glb:
+            - world_points (S,H,W,3) or world_points_from_depth
+            - world_points_conf (S,H,W) or depth_conf
+            - images (S,H,W,3) or (S,3,H,W)
+            - extrinsic (S,3,4) optional (not used here)
+        out_path (str): path to write the .ply file.
+        conf_thres (float): percent (0-100) used as percentile threshold. If 0 => keep all.
+        filter_by_frames (str): "all" or "FRAME_IDX:..." same parsing as predictions_to_glb
+        mask_black_bg, mask_white_bg (bool): background filtering options (same as in glb)
+        prediction_mode (str): if contains "Pointmap" use world_points, else use depth branch.
+        as_binary (bool): write binary PLY if True else ASCII PLY.
+
+    Returns:
+        tuple (out_path, trimesh.PointCloud): written file path and pointcloud object.
+    """
+    # --- validate inputs ---
+    if not isinstance(predictions, dict):
+        raise ValueError("predictions must be a dictionary")
+
+    # choose branch (copy logic from predictions_to_glb)
+    if "Pointmap" in prediction_mode:
+        if "world_points" in predictions:
+            pred_world_points = predictions["world_points"]
+            pred_world_points_conf = predictions.get("world_points_conf", np.ones_like(pred_world_points[..., 0]))
+        else:
+            pred_world_points = predictions["world_points_from_depth"]
+            pred_world_points_conf = predictions.get("depth_conf", np.ones_like(pred_world_points[..., 0]))
+    else:
+        pred_world_points = predictions["world_points_from_depth"]
+        pred_world_points_conf = predictions.get("depth_conf", np.ones_like(pred_world_points[..., 0]))
+
+    images = predictions["images"]
+
+    # frame selection (same parsing as predictions_to_glb)
+    selected_frame_idx = None
+    if filter_by_frames != "all" and filter_by_frames != "All":
+        try:
+            selected_frame_idx = int(filter_by_frames.split(":")[0])
+        except (ValueError, IndexError):
+            selected_frame_idx = None
+
+    if selected_frame_idx is not None:
+        pred_world_points = pred_world_points[selected_frame_idx][None]
+        pred_world_points_conf = pred_world_points_conf[selected_frame_idx][None]
+        images = images[selected_frame_idx][None]
+
+    # Flatten vertices
+    vertices_3d = pred_world_points.reshape(-1, 3)
+
+    # Ensure images in NHWC format
+    if images.ndim == 4 and images.shape[1] == 3:  # NCHW => NHWC
+        colors_rgb = np.transpose(images, (0, 2, 3, 1))
+    else:
+        colors_rgb = images
+    colors_rgb = (colors_rgb.reshape(-1, 3) * 255).astype(np.uint8)
+
+    conf = pred_world_points_conf.reshape(-1)
+
+    # convert conf_thres percent -> threshold value (0 => keep all)
+    if conf_thres == 0.0:
+        conf_threshold = 0.0
+    else:
+        # if all zeros or very small, np.percentile still works
+        conf_threshold = np.percentile(conf, conf_thres)
+
+    conf_mask = (conf >= conf_threshold) & (conf > 1e-5)
+
+    # background filters
+    if mask_black_bg:
+        black_bg_mask = colors_rgb.sum(axis=1) >= 16
+        conf_mask = conf_mask & black_bg_mask
+
+    if mask_white_bg:
+        white_bg_mask = ~((colors_rgb[:, 0] > 240) & (colors_rgb[:, 1] > 240) & (colors_rgb[:, 2] > 240))
+        conf_mask = conf_mask & white_bg_mask
+
+    # apply mask
+    vertices_3d = vertices_3d[conf_mask]
+    colors_rgb = colors_rgb[conf_mask]
+
+    # fallback if empty
+    if vertices_3d is None or np.asarray(vertices_3d).size == 0:
+        vertices_3d = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+        colors_rgb = np.array([[255, 255, 255]], dtype=np.uint8)
+
+    # build trimesh PointCloud
+    pc = trimesh.PointCloud(vertices=vertices_3d, colors=colors_rgb)
+
+    # export PLY bytes
+    try:
+        ply_bytes = pc.export(file_type="ply")
+    except Exception as e:
+        # fallback: try export to ascii via structured save
+        # Construct a simple ASCII PLY (safe fallback)
+        header = ["ply", "format ascii 1.0", f"element vertex {len(vertices_3d)}",
+                  "property float x", "property float y", "property float z",
+                  "property uchar red", "property uchar green", "property uchar blue",
+                  "end_header"]
+        lines = header[:]
+        for v, c in zip(vertices_3d, colors_rgb):
+            lines.append(f"{v[0]} {v[1]} {v[2]} {int(c[0])} {int(c[1])} {int(c[2])}")
+        ply_text = "\n".join(lines).encode("utf-8")
+        ply_bytes = ply_text
+
+    # write file (binary or ascii depending on ply_bytes type)
+    mode = "wb"
+    with open(out_path, mode) as f:
+        if isinstance(ply_bytes, (bytes, bytearray)):
+            f.write(ply_bytes)
+        else:
+            # some trimesh versions return str
+            f.write(str(ply_bytes).encode("utf-8"))
+
+    return out_path, pc
